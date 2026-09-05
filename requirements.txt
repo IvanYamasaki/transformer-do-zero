@@ -1,0 +1,3 @@
+# O modelo em si so precisa de torch. matplotlib e opcional (demo.py --plots).
+torch>=2.0
+matplotlib>=3.5

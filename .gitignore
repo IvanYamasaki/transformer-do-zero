@@ -1,0 +1,28 @@
+# Dados e artefatos gerados pelo treino
+data/
+checkpoints/
+figures/
+
+# Fontes de trabalho que nao vao para o repositorio
+# (o relatorio e publicado como PDF; as figuras ficam embutidas nele)
+make_figures.py
+relatorio/*.tex
+WALKTHROUGH.md
+WALKTHROUGH.pdf
+attention is all you need.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# LaTeX
+*.aux
+*.log
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
