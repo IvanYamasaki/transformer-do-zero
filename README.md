@@ -25,6 +25,7 @@ incluindo equivalência numérica com o `nn.MultiheadAttention` do próprio PyTo
 | Entender a arquitetura em alto nível, com diagramas | [`relatorio/transformer.pdf`](relatorio/transformer.pdf) |
 | Ver como cada etapa é feita no código, linha por linha | [O código, passo a passo](#o-código-passo-a-passo), mais abaixo |
 | Rodar e mexer | [Começando](#começando) |
+| Ver as anotações à mão que deram origem a tudo isso | [`anotacoes.jpeg`](anotacoes.jpeg) |
 
 O percurso pelo código segue uma única frase, `"Ein Mann geht."`, do texto cru
 até a tradução `"A man is walking ."`, mostrando os valores reais produzidos pelo
