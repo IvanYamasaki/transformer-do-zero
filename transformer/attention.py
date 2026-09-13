@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .flash import IMPLEMENTACOES, flash_attention, sdpa_attention
+
 
 def scaled_dot_product_attention(query, key, value, mask=None, dropout=None):
     """Attention(Q, K, V) = softmax(Q K^T / sqrt(d_k)) V   (eq. 1 do paper).
@@ -43,16 +45,30 @@ class MultiHeadAttention(nn.Module):
 
     As equacoes do paper nao tem termo de bias (sao produtos QW, KW, VW e
     Concat(...)W^O puros), por isso bias=False e o padrao.
+
+    `impl` escolhe como o produto da atencao e feito. Os tres dao o mesmo
+    resultado; mudam a memoria e a velocidade (ver transformer/flash.py):
+
+        "math"   materializa a matriz (B, h, L, L). E o padrao, e o unico que
+                 devolve os pesos para visualizacao.
+        "flash"  FlashAttention em PyTorch puro, por blocos, com backward
+                 proprio. Nao materializa a matriz nem no treino, entao
+                 economiza memoria; nao acelera.
+        "sdpa"   kernel fundido do PyTorch; em GPU vira FlashAttention-2.
     """
 
-    def __init__(self, d_model=512, num_heads=8, dropout=0.1, bias=False):
+    def __init__(self, d_model=512, num_heads=8, dropout=0.1, bias=False, impl="math"):
         super().__init__()
         if d_model % num_heads != 0:
             raise ValueError(f"d_model ({d_model}) precisa ser divisivel por num_heads ({num_heads})")
+        if impl not in IMPLEMENTACOES:
+            raise ValueError(f"impl deve ser um de {IMPLEMENTACOES}, nao {impl!r}")
 
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
+        self.impl = impl
+        self.dropout_p = dropout
 
         self.w_q = nn.Linear(d_model, d_model, bias=bias)
         self.w_k = nn.Linear(d_model, d_model, bias=bias)
@@ -81,8 +97,18 @@ class MultiHeadAttention(nn.Module):
         k = self._split_heads(self.w_k(key))
         v = self._split_heads(self.w_v(value))
 
-        out, attn = scaled_dot_product_attention(q, k, v, mask=mask, dropout=self.dropout)
+        # "flash" e "sdpa" nunca montam a matriz de pesos, entao nao ha o que
+        # capturar: quem pede os pesos cai no caminho "math".
+        impl = "math" if need_weights else self.impl
+        if impl == "flash":
+            out, attn = flash_attention(q, k, v, mask=mask,
+                                        dropout_p=self.dropout_p if self.training else 0.0)
+        elif impl == "sdpa":
+            out, attn = sdpa_attention(q, k, v, mask=mask,
+                                       dropout_p=self.dropout_p if self.training else 0.0)
+        else:
+            out, attn = scaled_dot_product_attention(q, k, v, mask=mask, dropout=self.dropout)
         out = self.w_o(self._merge_heads(out))
 
-        self.attn_weights = attn.detach() if need_weights else None
+        self.attn_weights = attn.detach() if (need_weights and attn is not None) else None
         return out

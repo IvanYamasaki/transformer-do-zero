@@ -27,6 +27,7 @@ from transformer import (  # noqa: E402
     scaled_dot_product_attention,
     subsequent_mask,
 )
+from transformer.flash import flash_attention, sdpa_attention  # noqa: E402
 
 torch.manual_seed(0)
 PAD, BOS, EOS = 0, 1, 2
@@ -278,6 +279,163 @@ def test_attention_maps_are_captured():
     maps = model.attention_maps()
     assert "encoder.0.self_attn" in maps and "decoder.0.cross_attn" in maps
     assert maps["decoder.0.cross_attn"].shape == (1, 4, 5, 6)
+
+
+# --------------------------------------------------------------------------- #
+# FlashAttention (Dao et al., 2022): mesma conta, sem a matriz L x L
+# --------------------------------------------------------------------------- #
+
+def _tres_tensores(b=2, h=4, l_q=37, l_k=37, d_k=16, d_v=16, dtype=torch.float64):
+    """Q, K, V em float64 — precisao suficiente para comparar gradiente."""
+    torch.manual_seed(0)
+    q = torch.randn(b, h, l_q, d_k, dtype=dtype, requires_grad=True)
+    k = torch.randn(b, h, l_k, d_k, dtype=dtype, requires_grad=True)
+    v = torch.randn(b, h, l_k, d_v, dtype=dtype, requires_grad=True)
+    return q, k, v
+
+
+def _mascaras(l=37):
+    causal = subsequent_mask(l)
+    padding = torch.ones(2, 1, 1, l, dtype=torch.bool)
+    padding[1, ..., 20:] = False
+    return {"sem": None, "causal": causal, "padding": padding,
+            "causal+padding": causal & padding}
+
+
+def test_flash_attention_matches_math_exactly():
+    """FlashAttention e atencao EXATA, nao aproximacao: o softmax online
+    reescala os blocos ja acumulados e chega no mesmo numero."""
+    q, k, v = _tres_tensores()
+    esperado, _ = scaled_dot_product_attention(q, k, v)
+    # blocos que nao dividem 37 de proposito, para pegar erro de borda
+    obtido, pesos = flash_attention(q, k, v, block_q=8, block_k=5)
+    assert torch.allclose(esperado, obtido, atol=1e-12)
+    assert pesos is None, "o algoritmo nao materializa a matriz de pesos"
+
+
+def test_flash_backward_matches_autograd_under_every_mask():
+    """O backward recomputa P em vez de le-lo, e ainda assim devolve o MESMO
+    gradiente que o autograd calcula sobre a matriz inteira."""
+    for nome, mask in _mascaras().items():
+        q, k, v = _tres_tensores()
+        alvo = torch.randn(2, 4, 37, 16, dtype=torch.float64)
+
+        esperado, _ = scaled_dot_product_attention(q, k, v, mask=mask)
+        g_esperado = torch.autograd.grad(esperado, (q, k, v), alvo)
+
+        obtido, _ = flash_attention(q, k, v, mask=mask, block_q=8, block_k=5)
+        g_obtido = torch.autograd.grad(obtido, (q, k, v), alvo)
+
+        for nome_grad, a, b in zip("QKV", g_esperado, g_obtido):
+            assert torch.allclose(a, b, atol=1e-10), f"d{nome_grad} com mascara {nome}"
+
+
+def test_flash_backward_passes_gradcheck_with_dropout():
+    """Com semente fixa a funcao e deterministica, entao gradcheck se aplica.
+    Passar aqui prova que o backward refaz a MESMA mascara de dropout do
+    forward — se errasse o sorteio, o gradiente nao bateria."""
+    q, k, v = _tres_tensores(b=1, h=2, l_q=9, l_k=9, d_k=8, d_v=8)
+    fn = lambda a, b, c: flash_attention(a, b, c, dropout_p=0.3, block_q=4,
+                                         block_k=3, semente=1234)[0]
+    assert torch.autograd.gradcheck(fn, (q, k, v), eps=1e-6, atol=1e-8)
+
+
+def test_flash_dropout_is_reproducible_from_the_seed():
+    q, k, v = _tres_tensores(b=1, h=2, l_q=9, l_k=9, d_k=8, d_v=8)
+    a, _ = flash_attention(q, k, v, dropout_p=0.3, semente=7)
+    b, _ = flash_attention(q, k, v, dropout_p=0.3, semente=7)
+    c, _ = flash_attention(q, k, v, dropout_p=0.3, semente=8)
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+
+
+def test_flash_attention_handles_d_v_different_from_d_k():
+    """O paper usa d_v = d_k, mas a equacao nao exige: a saida herda d_v de V."""
+    q, k, v = _tres_tensores(l_q=19, l_k=23, d_k=16, d_v=32)
+    esperado, _ = scaled_dot_product_attention(q, k, v)
+    obtido, _ = flash_attention(q, k, v, block_q=5, block_k=7)
+    assert obtido.shape == (2, 4, 19, 32)
+    assert torch.allclose(esperado, obtido, atol=1e-12)
+
+
+def test_flash_attention_respects_masks():
+    """Mascara causal e mascara de padding, inclusive com broadcast em L_q."""
+    q, k, v = _tres_tensores(l_q=13, l_k=13)
+    for mask in (subsequent_mask(13), None):
+        esperado, _ = scaled_dot_product_attention(q, k, v, mask=mask)
+        obtido, _ = flash_attention(q, k, v, mask=mask, block_q=4, block_k=4)
+        assert torch.allclose(esperado, obtido, atol=1e-12)
+
+
+def test_flash_attention_survives_a_fully_masked_row():
+    """Linha 100% mascarada nao pode virar NaN, nem no forward nem no backward."""
+    q, k, v = _tres_tensores(b=1, h=2, l_q=6, l_k=6)
+    mask = torch.ones(1, 1, 6, 6, dtype=torch.bool)
+    mask[..., 3, :] = False
+    obtido, _ = flash_attention(q, k, v, mask=mask, block_q=2, block_k=2)
+    assert torch.isfinite(obtido).all()
+    grads = torch.autograd.grad(obtido.sum(), (q, k, v))
+    assert all(torch.isfinite(g).all() for g in grads)
+
+
+def test_sdpa_attention_matches_math():
+    """O kernel fundido do PyTorch faz a mesma conta, saida e gradiente."""
+    q, k, v = _tres_tensores(l_q=21, l_k=21)
+    mask = subsequent_mask(21)
+    alvo = torch.randn(2, 4, 21, 16, dtype=torch.float64)
+    esperado, _ = scaled_dot_product_attention(q, k, v, mask=mask)
+    g_esperado = torch.autograd.grad(esperado, (q, k, v), alvo)
+    obtido, _ = sdpa_attention(q, k, v, mask=mask)
+    g_obtido = torch.autograd.grad(obtido, (q, k, v), alvo)
+    assert torch.allclose(esperado, obtido, atol=1e-12)
+    for a, b in zip(g_esperado, g_obtido):
+        assert torch.allclose(a, b, atol=1e-10)
+
+
+def test_model_gives_same_logits_and_grads_with_every_attention_impl():
+    """Trocar a implementacao nao muda nem a saida nem o gradiente do modelo."""
+    torch.manual_seed(0)
+    src = torch.randint(4, 50, (2, 7))
+    tgt = torch.randint(4, 50, (2, 6))
+    referencia, grad_ref = None, None
+    for impl in ("math", "flash", "sdpa"):
+        torch.manual_seed(0)
+        cfg = TransformerConfig(50, 50, num_layers=2, d_model=32, num_heads=4,
+                                d_ff=64, dropout=0.0, attention=impl)
+        model = Transformer(cfg).train()
+        logits = model(src, tgt)
+        logits.sum().backward()
+        g = model.encoder.layers[0].self_attn.w_q.weight.grad.clone()
+        if referencia is None:
+            referencia, grad_ref = logits.detach(), g
+        else:
+            assert torch.allclose(referencia, logits.detach(), atol=1e-5), impl
+            assert torch.allclose(grad_ref, g, atol=1e-5), f"gradiente com {impl}"
+
+
+def test_need_weights_falls_back_to_math():
+    """Pedir os pesos com impl='flash' cai no caminho que os materializa."""
+    torch.manual_seed(0)
+    cfg = TransformerConfig(50, 50, num_layers=1, d_model=32, num_heads=4,
+                            d_ff=64, dropout=0.0, attention="flash")
+    model = Transformer(cfg).eval()
+    model(torch.randint(4, 50, (1, 5)), torch.randint(4, 50, (1, 4)), need_weights=True)
+    maps = model.attention_maps()
+    assert maps["decoder.0.cross_attn"].shape == (1, 4, 4, 5)
+
+
+def test_flash_saves_only_o_and_logsumexp():
+    """O forward guarda para o backward apenas tensores O(L), nunca O(L^2).
+
+    Se a matriz de probabilidades ficasse guardada, o total salvo passaria de
+    L*L por cabeca. Aqui o maior tensor salvo tem L*d_k elementos.
+    """
+    q, k, v = _tres_tensores(b=1, h=2, l_q=64, l_k=64, d_k=8, d_v=8)
+    saida, _ = flash_attention(q, k, v, block_q=16, block_k=16)
+    salvos = saida.grad_fn.saved_tensors
+    maior = max(s.numel() for s in salvos)
+    assert maior <= 1 * 2 * 64 * 8, f"algo O(L^2) ficou guardado: {maior} elementos"
+    assert all(s.numel() != 1 * 2 * 64 * 64 for s in salvos)
 
 
 # --------------------------------------------------------------------------- #

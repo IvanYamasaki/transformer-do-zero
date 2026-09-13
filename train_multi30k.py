@@ -9,7 +9,10 @@ O que NAO da para copiar do paper e o tamanho: WMT14 tem 4.5M pares e batches de
 25k tokens; o Multi30k tem 29k pares e cabe numa GPU de 6 GB com ~2.5k tokens.
 
     python train_multi30k.py                         # ~30 min numa GPU modesta
-    python train_multi30k.py --epochs 2 --limit 2000  # smoke test
+    python train_multi30k.py --epochs 2 --limit 2000 --save /tmp/teste.pt   # smoke test
+
+Se o checkpoint de destino ja existe, o script para: um smoke test com o --save
+padrao apagaria 30 minutos de treino. Passe --force para sobrescrever de fato.
 """
 
 import argparse
@@ -122,6 +125,9 @@ def main():
     ap.add_argument("--heads", type=int, default=8)
     ap.add_argument("--d-ff", type=int, default=2048)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--attention", default="math", choices=["math", "flash", "sdpa"],
+                    help="implementacao da atencao (ver transformer/flash.py); "
+                         "sdpa usa o kernel FlashAttention-2 em GPU")
     ap.add_argument("--warmup", type=int, default=4000)
     ap.add_argument("--label-smoothing", type=float, default=0.1)
     ap.add_argument("--average-last", type=int, default=5, help="checkpoints promediados (6.1)")
@@ -132,9 +138,17 @@ def main():
     ap.add_argument("--eval-sentences", type=int, default=300, help="frases de teste para o BLEU")
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--save", default="checkpoints/multi30k.pt")
+    ap.add_argument("--force", action="store_true",
+                    help="sobrescreve o checkpoint se ele ja existir")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    # Um treino completo custa ~30 min de GPU. Sobrescrever o resultado com um
+    # smoke test e facil demais, entao o padrao e recusar.
+    if Path(args.save).exists() and not args.force:
+        sys.exit(f"{args.save} ja existe. Use --force para sobrescrever, "
+                 f"ou --save com outro caminho (ex.: --save /tmp/teste.pt).")
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -178,10 +192,11 @@ def main():
         pad_idx=PAD_IDX,
         share_embeddings=True,   # secao 3.4: um vocabulario, tres pesos amarrados
         tie_generator=True,
+        attention=args.attention,
     )).to(device)
     print(f"  N={args.layers} d_model={args.d_model} h={args.heads} d_ff={args.d_ff} "
           f"dropout={args.dropout} | {model.num_parameters():,} parametros | {device}"
-          f"{' | bfloat16' if use_amp else ''}")
+          f"{' | bfloat16' if use_amp else ''} | atencao: {args.attention}")
 
     loss_fn = LabelSmoothingLoss(len(vocab), pad_idx=PAD_IDX, smoothing=args.label_smoothing)
     optimizer, scheduler = make_optimizer(model, d_model=args.d_model, warmup=args.warmup)

@@ -40,9 +40,9 @@ class ResidualConnection(nn.Module):
 class EncoderLayer(nn.Module):
     """Self-attention + feed-forward, cada um com residual e norm."""
 
-    def __init__(self, d_model=512, num_heads=8, d_ff=2048, dropout=0.1):
+    def __init__(self, d_model=512, num_heads=8, d_ff=2048, dropout=0.1, impl="math"):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, impl=impl)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.sublayers = clones(ResidualConnection(d_model, dropout), 2)
 
@@ -54,10 +54,10 @@ class EncoderLayer(nn.Module):
 class DecoderLayer(nn.Module):
     """Self-attention mascarada + cross-attention sobre o encoder + feed-forward."""
 
-    def __init__(self, d_model=512, num_heads=8, d_ff=2048, dropout=0.1):
+    def __init__(self, d_model=512, num_heads=8, d_ff=2048, dropout=0.1, impl="math"):
         super().__init__()
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout, impl=impl)
+        self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout, impl=impl)
         self.feed_forward = PositionwiseFeedForward(d_model, d_ff, dropout)
         self.sublayers = clones(ResidualConnection(d_model, dropout), 3)
 

@@ -12,6 +12,7 @@ from .attention import MultiHeadAttention, scaled_dot_product_attention
 from .bpe import BPE, learn_bpe
 from .decoding import beam_search, greedy_decode
 from .embeddings import LearnedPositionalEmbedding, PositionalEncoding, TokenEmbedding
+from .flash import flash_attention, sdpa_attention
 from .layers import DecoderLayer, EncoderLayer, PositionwiseFeedForward, ResidualConnection
 from .masking import make_source_mask, make_target_mask, padding_mask, subsequent_mask
 from .model import Decoder, Encoder, Transformer, TransformerConfig, make_model
@@ -25,6 +26,8 @@ __all__ = [
     "learn_bpe",
     "MultiHeadAttention",
     "scaled_dot_product_attention",
+    "flash_attention",
+    "sdpa_attention",
     "TokenEmbedding",
     "PositionalEncoding",
     "LearnedPositionalEmbedding",

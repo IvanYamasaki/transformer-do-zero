@@ -28,6 +28,7 @@ class TransformerConfig:
     share_embeddings: bool = True   # amarra embeddings src/tgt (exige vocabulario unico)
     tie_generator: bool = True      # amarra a projecao pre-softmax ao embedding (secao 3.4)
     positional: str = "sinusoidal"  # "sinusoidal" (secao 3.5) ou "learned" (Table 3, linha E)
+    attention: str = "math"         # "math" (paper), "flash" ou "sdpa" (ver transformer/flash.py)
 
     @classmethod
     def base(cls, src_vocab_size, tgt_vocab_size, **kwargs):
@@ -112,8 +113,10 @@ class Transformer(nn.Module):
         else:
             raise ValueError(f"positional deve ser 'sinusoidal' ou 'learned', nao {cfg.positional!r}")
 
-        enc_layer = EncoderLayer(cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.dropout)
-        dec_layer = DecoderLayer(cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.dropout)
+        enc_layer = EncoderLayer(cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.dropout,
+                                 impl=cfg.attention)
+        dec_layer = DecoderLayer(cfg.d_model, cfg.num_heads, cfg.d_ff, cfg.dropout,
+                                 impl=cfg.attention)
         self.encoder = Encoder(enc_layer, cfg.num_layers)
         self.decoder = Decoder(dec_layer, cfg.num_layers)
 

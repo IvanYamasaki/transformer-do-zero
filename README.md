@@ -230,6 +230,152 @@ from transformer import average_checkpoints
 model.load_state_dict(average_checkpoints(["ep21.pt", "ep22.pt", "ep23.pt", "ep24.pt", "ep25.pt"]))
 ```
 
+## FlashAttention
+
+O paper de 2017 calcula `softmax(QKᵀ/√d_k)V` materializando a matriz de scores
+inteira, `(B, h, L, L)`. Essa matriz é o gargalo: cresce com `L²` e vai e volta
+da memória da GPU duas vezes. FlashAttention (Dao et al., 2022) percorre `Q` em
+blocos e mantém o softmax em forma incremental, guardando por linha só o máximo
+corrente `m` e a soma dos expoentes `l`. A matriz completa nunca existe, e o
+resultado é **exato**, não uma aproximação.
+
+No treino o problema é pior do que na inferência, e é essa metade que costuma
+ser esquecida. Para calcular o gradiente, o autograd precisa da matriz de
+probabilidades `P` que o forward produziu, então ele a **guarda** até o backward
+acontecer. Uma pilha de 6 camadas segura 6 dessas matrizes ao mesmo tempo. É por
+isso que a economia real do FlashAttention aparece no backward, não no forward,
+e é lá que a implementação daqui faz o trabalho interessante.
+
+[`transformer/flash.py`](transformer/flash.py) traz as duas alternativas à do
+paper. A escolha é por `TransformerConfig(attention=...)`:
+
+| `attention` | o que faz | quando usar |
+|---|---|---|
+| `"math"` | materializa a matriz `(B, h, L, L)` | padrão; é o único que devolve os pesos para visualizar |
+| `"flash"` | o algoritmo por blocos, em PyTorch puro | ler e entender; economiza memória, **não** acelera |
+| `"sdpa"` | `F.scaled_dot_product_attention` | em GPU vira o kernel FlashAttention-2; é o caminho rápido |
+
+```python
+TransformerConfig(9740, 9740, attention="sdpa")
+```
+
+```bash
+python train_multi30k.py --attention sdpa
+```
+
+Pedir `need_weights=True` cai automaticamente no caminho `"math"`: os outros dois
+não montam a matriz de pesos, que é justamente o ponto deles.
+
+### O backward, que é onde está a graça
+
+O forward é a parte fácil de explicar: `softmax([x, y])` pode ser montado a
+partir das metades, reescalando cada uma por `exp(m_parcial − m_novo)`. No fim
+guarda-se, por linha, o `logsumexp`:
+
+```
+L = m + log(l)
+```
+
+que é um vetor de tamanho `L`, não uma matriz `L×L`. Com ele, `P = exp(S − L)`
+já sai normalizado.
+
+O backward parece impossível de fazer em blocos, e não é. Derivando
+`o = Σⱼ pⱼ vⱼ` com `p = softmax(s)`:
+
+```
+∂L/∂sᵢ = pᵢ · ( dPᵢ − Σⱼ pⱼ dPⱼ ),     dPⱼ = dO · vⱼ
+```
+
+O termo `Σⱼ pⱼ dPⱼ` parece exigir a linha inteira de `P` de uma vez, o que
+derrubaria a ideia toda. Mas ele se reescreve:
+
+```
+Σⱼ pⱼ dPⱼ = dO · ( Σⱼ pⱼ vⱼ ) = dO · o
+```
+
+ou seja, é a **soma por linha de `dO ∘ O`**, dois tensores `O(L·d)` que já estão
+na memória. Chamando isso de `D`, cada bloco precisa apenas de `Dᵢ`:
+
+```
+dSᵢⱼ = Pᵢⱼ ∘ ( dPᵢⱼ − Dᵢ )
+```
+
+É essa identidade que permite varrer o backward bloco a bloco. O `Pᵢⱼ` de cada
+bloco é **recalculado** a partir de `Q`, `K` e do `logsumexp` guardado, em vez de
+lido de lugar nenhum. Recomputar custa FLOPs, mas atenção é limitada por
+memória e não por conta, então a troca compensa.
+
+`_FlashAttention` é uma `torch.autograd.Function` com o forward e o backward
+escritos à mão, em [`transformer/flash.py`](transformer/flash.py). O dropout
+também é reconstruído: cada chamada sorteia uma semente, e o backward recria a
+mesma máscara que o forward usou, do mesmo jeito que o kernel CUDA faz com um
+contador Philox. O teste que prova isso é um `gradcheck` com `dropout_p=0.3` e
+semente fixa: se o backward errasse o sorteio, o gradiente numérico não bateria.
+
+### Medido nesta máquina
+
+Numa RTX 3050 6 GB, `B=8`, `h=8`, `d_k=64`, máscara causal, só o forward. Cada
+célula é a mediana de três execuções, **cada tamanho em seu próprio processo**:
+rodar a varredura inteira num processo só aquece o alocador da GPU e o tempo do
+`math` em `L = 4096` muda por um fator de 3.
+
+`python bench_attention.py --dtype bfloat16 --lengths 2048`
+
+| L | matriz `L×L` | math | flash | sdpa | mem. math | mem. flash | mem. sdpa |
+|---|---|---|---|---|---|---|---|
+| 1024 | 128 MB | 13,2 ms | 39,7 ms | **1,8 ms** | 305 MB | 118 MB | **51 MB** |
+| 2048 | 512 MB | 48,5 ms | 157,2 ms | **8,0 ms** | 1 116 MB | 161 MB | **100 MB** |
+| 4096 | 2 048 MB | 543,9 ms | 624,7 ms | **39,2 ms** | 4 280 MB | 254 MB | **216 MB** |
+
+Em `L = 4096` o kernel fundido é 13,9× mais rápido que a versão do paper e usa
+20× menos memória. O ganho cresce com `L`, como tem que crescer: é a matriz
+`L×L` que ele deixa de escrever.
+
+A coluna do meio é o ponto que eu não esperava. A versão em PyTorch puro perde
+feio em tempo nos tamanhos pequenos (3× em `L = 1024`), mas o pico de memória
+dela quase não sobe: 118 MB em `L = 1024`, 254 MB em `L = 4096`, contra 305 MB e
+4 280 MB do `math`. Em `L = 4096` a distância em tempo já caiu para 15%
+(625 ms contra 544 ms), e em `float32`, onde a matriz passa a ocupar 4 GB, ela
+ganha por 8×: 611 ms contra 5 139 ms. Não porque ficou rápida, mas porque a
+outra parou de caber.
+
+Com o backward ligado (`--backward`), que é o caso do treino, os números mudam
+de figura. A matriz que o autograd guardaria passa a pesar:
+
+| L | matriz `L×L` | math | flash | sdpa | mem. math | mem. flash | mem. sdpa |
+|---|---|---|---|---|---|---|---|
+| 512 | 32 MB | 11,1 ms | 35,0 ms | **4,2 ms** | 165 MB | 161 MB | **57 MB** |
+| 1024 | 128 MB | 34,1 ms | 130,7 ms | **9,9 ms** | 570 MB | 206 MB | **100 MB** |
+| 2048 | 512 MB | 148,0 ms | 473,5 ms | **35,2 ms** | 2 152 MB | 313 MB | **189 MB** |
+
+Aqui a versão em PyTorch puro deixa de ser só didática: em `L = 2048` ela usa
+313 MB contra 2 152 MB do `math`, uma economia de 6,9×, porque o backward dela
+não lê `P` de lugar nenhum. Continua 3,2× mais lenta, e continua sem sentido
+usar em produção quando o `sdpa` existe. Mas é a diferença entre um modelo que
+cabe na placa e um que não cabe.
+
+Duas observações que as medições impuseram:
+
+**O dtype decide se o kernel entra.** Os kernels FlashAttention são escritos para
+`fp16` e `bf16`. Em `float32` o PyTorch despacha para outro kernel e o `sdpa` em
+`L = 4096` vai de 39 ms para 563 ms, 14× mais lento, com a mesma conta e quase a
+mesma memória. O treino daqui roda em `bfloat16`, então pega o caminho bom.
+
+**O `math` em `L = 4096` não é uma medida estável** (amplitude de 50 ms entre
+repetições, contra 2 ms do `sdpa`). Ele aloca 4,3 GB numa placa de 6 GB, e o
+tempo passa a depender do estado da memória. Em `float32` são 8,5 GB pedidos a
+uma placa de 6, o driver passa a usar memória do sistema e a medida vai a 5,1 s.
+Esse número diz mais sobre a placa do que sobre o algoritmo, e é exatamente o
+problema que o FlashAttention existe para resolver.
+
+Equivalência coberta por onze testes em
+[`tests/test_transformer.py`](tests/test_transformer.py), e o gradiente é testado
+tão de perto quanto a saída: `dQ`, `dK` e `dV` conferidos contra o autograd em
+`float64` sob quatro configurações de máscara, `gradcheck` com dropout, linha
+100% mascarada sem `NaN` no backward, e igualdade dos gradientes do modelo
+inteiro nas três implementações. Um teste inspeciona os tensores que o forward
+guardou e falha se algum for `O(L²)`.
+
 ## Decisões de implementação
 
 **Post-LN, e só post-LN.** `LayerNorm(x + Sublayer(x))`, exatamente como o paper.
